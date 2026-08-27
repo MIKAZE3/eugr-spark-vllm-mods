@@ -11,6 +11,15 @@
 | `gds_direct_v1/` | `vllm/v1/kv_offload/gds/`（另改动上游 1 行） | **GPU↔SSD 直通 KV 卸载**（cuFile/GDS）——彻底移除 CPU 主层。长上下文重放由 ~1.00×（全量重算）提升至 **P128/P512/P800 的 51×/118×/163×**。包含：`GdsDirectOffloadingSpec`（manager+worker）、带 LRU 句柄缓存与三级注册降级的 cuFile 池、chunk 相对偏移的 D2D 规划，以及上游 `assert transfer_result.success` 的放宽补丁。 |
 | `fix-nvfp4-kv-sm121/` | NVFP4 KV 缓存（构建期编译进 `.so` + 运行期） | 使 `--kv-cache-dtype nvfp4` 在 sm120/sm121（DGX Spark GB10）上输出正确且吞吐达标：修复 interleaved/separated 布局不匹配、NVFP4 KV 禁用 XQA decode、空 architectures 守卫、Eagle3 投机解码 warmup 挂起修复。 |
 
+## 部署与使用
+
+每个 mod 自带完整手册，按序执行即可：
+
+| Mod | 手册 | 要点 |
+|---|---|---|
+| `gds_direct_v1/` | [`gds_direct_v1/README.md`](gds_direct_v1/README.md) | 宿主机 `nvidia_fs` 模块 + 容器设备节点 + `/run/udev` → `docker cp pkg/gds` + F6 补丁（`patch_offloading_worker_assert.py`）+ import 自检 → 设置环境变量（`PYTHONHASHSEED=0`、`VLLM_GDS_RING_DEPTH=32`、`VLLM_SERVER_DEV_MODE=1`）与 `--kv-transfer-config` → 重启集群（node1 → 25s → node2~4）→ 用 `POST /reset_prefix_cache` 重放验证。回滚 = 换回配置字符串。 |
+| `fix-nvfp4-kv-sm121/` | [`fix-nvfp4-kv-sm121/DEPLOY.md`](fix-nvfp4-kv-sm121/DEPLOY.md) | 先构建期：`vllm-nvfp4-layout-fix.patch` 由 Dockerfile 构建 wheel 时自动应用；再运行期（每次容器）：装 wheel + flashinfer 0.6.18 + 跑 `run.sh`（校验构建期修复已就位）。NVFP4+Eagle3 必须 `cudagraph_mode=PIECEWISE`——FULL 模式会损坏投机解码采样。 |
+
 ## 目录约定
 
 - `run.sh` / `apply_mod.sh` — 幂等应用入口，在 GPU 节点宿主上执行（注明需在容器内执行的情况）。
