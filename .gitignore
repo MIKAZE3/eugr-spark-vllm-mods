@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+bundle.tar.gz
+bundle.b64
+bundle/
+_head*.py
+_new_worker*.py
+_tail*.py

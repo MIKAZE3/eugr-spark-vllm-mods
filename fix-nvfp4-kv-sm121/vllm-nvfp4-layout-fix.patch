@@ -1,0 +1,145 @@
+diff --git a/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu b/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu
+index 6a968eb78..3e75b912a 100644
+--- a/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu
++++ b/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu
+@@ -203,6 +203,7 @@ __global__ void reshape_and_cache_nvfp4_kernel(
+   const int block_offset = static_cast<int>(slot_idx % block_size);
+ 
+   const int scale_dim = head_size / 16;
++  const int data_dim = head_size / 2;
+   const int groups_per_head = head_size / CVT_FP4_SF_VEC_SIZE;
+ 
+   const int total_groups = num_heads * groups_per_head;
+@@ -291,7 +292,8 @@ __global__ void reshape_and_cache_nvfp4_kernel(
+         uint8_t* __restrict__ scale_dst;
+         if (kv == 0 || !swizzle_v_sf) {
+           scale_dst = scale_block + head * scale_head_stride +
+-                      block_offset * scale_block_offset_stride + scale_idx;
++                      block_offset * scale_block_offset_stride +
++                      (swizzle_v_sf ? 0 : data_dim) + scale_idx;
+         } else {
+           int swizzled_offset =
+               swizzle_scale_offset(block_offset, scale_idx, scale_dim);
+@@ -355,7 +357,13 @@ void reshape_and_cache_nvfp4_dispatch(
+ 
+   int64_t data_block_stride = key_cache.stride(0);  // page_bytes
+   int64_t data_head_stride, data_block_offset_stride;
+-  if (is_hnd) {
++  if (!swizzle_v_sf && is_hnd) {
++    // SM12x FA2 path: vLLM packs NVFP4 HND caches interleaved per token
++    // (each token carries [data_dim | scale_dim] bytes), so the physical
++    // head/token strides are the tensor's own strides.
++    data_head_stride = key_cache.stride(2);
++    data_block_offset_stride = key_cache.stride(1);
++  } else if (is_hnd) {
+     data_head_stride = (int64_t)block_size * data_dim;
+     data_block_offset_stride = data_dim;
+   } else {
+@@ -367,19 +375,31 @@ void reshape_and_cache_nvfp4_dispatch(
+   // Scale follows data within each KV side.
+   int64_t data_per_kv = (int64_t)num_heads * block_size * data_dim;
+ 
+-  uint8_t* key_scale_ptr = key_cache.mutable_data_ptr<uint8_t>() + data_per_kv;
+-  uint8_t* value_scale_ptr =
+-      value_cache.mutable_data_ptr<uint8_t>() + data_per_kv;
++  uint8_t* key_scale_ptr;
++  uint8_t* value_scale_ptr;
+ 
+   // Scale strides: same page stride, inner strides from layout.
+   int64_t scale_block_stride = data_block_stride;
+   int64_t scale_head_stride, scale_block_offset_stride;
+-  if (is_hnd) {
+-    scale_head_stride = (int64_t)block_size * scale_dim;
+-    scale_block_offset_stride = scale_dim;
++  if (!swizzle_v_sf && is_hnd) {
++    // SM12x FA2: scales live in the same region as data, data_dim bytes
++    // into each token (interleaved [data | scale] layout).
++    key_scale_ptr = key_cache.mutable_data_ptr<uint8_t>();
++    value_scale_ptr = value_cache.mutable_data_ptr<uint8_t>();
++    scale_head_stride = key_cache.stride(2);
++    scale_block_offset_stride = key_cache.stride(1);
+   } else {
+-    scale_head_stride = scale_dim;
+-    scale_block_offset_stride = (int64_t)num_heads * scale_dim;
++    // SM100 trtllm-gen: scale region follows the data region.
++    key_scale_ptr = key_cache.mutable_data_ptr<uint8_t>() + data_per_kv;
++    value_scale_ptr =
++        value_cache.mutable_data_ptr<uint8_t>() + data_per_kv;
++    if (is_hnd) {
++      scale_head_stride = (int64_t)block_size * scale_dim;
++      scale_block_offset_stride = scale_dim;
++    } else {
++      scale_head_stride = scale_dim;
++      scale_block_offset_stride = (int64_t)num_heads * scale_dim;
++    }
+   }
+ 
+   const float* k_scale_ptr = k_scale.const_data_ptr<float>();
+diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
+index 058f2c277..0e8d5fa95 100644
+--- a/vllm/utils/torch_utils.py
++++ b/vllm/utils/torch_utils.py
+@@ -562,23 +562,19 @@ def nvfp4_split_data_scale(
+     data_per_kv = dim_1 * dim_2 * data_dim
+     page_bytes = kv_side.stride(0)
+ 
+-    # Derive inner strides from the kv_side strides, scaling by the
+-    # ratio of the target dim to full_dim.  This preserves the physical
+-    # layout (NHD vs HND) encoded in the input tensor's strides.
+-    s1 = kv_side.stride(1) * data_dim // full_dim
+-    s2 = kv_side.stride(2) * data_dim // full_dim
++    # vLLM packs NVFP4 HND caches interleaved per token: each token carries
++    # [data_dim | scale_dim] bytes contiguous, so data and scale share the
++    # side's physical strides and the scale view starts data_dim bytes into
++    # every token.
+     data_shape = (num_pages, dim_1, dim_2, data_dim)
+-    data_strides = (page_bytes, s1, s2, 1)
+-
+-    s1_s = kv_side.stride(1) * scale_dim // full_dim
+-    s2_s = kv_side.stride(2) * scale_dim // full_dim
++    data_strides = (page_bytes, kv_side.stride(1), kv_side.stride(2), 1)
+     scale_shape = (num_pages, dim_1, dim_2, scale_dim)
+-    scale_strides = (page_bytes, s1_s, s2_s, 1)
++    scale_strides = (page_bytes, kv_side.stride(1), kv_side.stride(2), 1)
+ 
+     base = kv_side.storage_offset()
+     data = torch.as_strided(kv_side, data_shape, data_strides, storage_offset=base)
+     scale = torch.as_strided(
+-        kv_side, scale_shape, scale_strides, storage_offset=base + data_per_kv
++        kv_side, scale_shape, scale_strides, storage_offset=base + data_dim
+     ).view(torch.float8_e4m3fn)
+ 
+     return data, scale
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 66ee31105..9626d3140 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -979,7 +979,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+             and can_use_xqa_or_trtllm_gen_decode
+             and self.num_qo_heads // self.num_kv_heads > 1
+         ), f"Unexpected FlashInfer page size {self.page_size} without trtllm-gen GQA"
+-        self.use_trtllm_decode_attention = can_use_xqa_or_trtllm_gen_decode
++        self.use_trtllm_decode_attention = (
++            can_use_xqa_or_trtllm_gen_decode
++            and not (self.is_kvcache_nvfp4 and current_platform.is_device_capability_family(120))
++        )
+         self.flashinfer_trtllm_api_decode_kernel: FlashInferDecodeKernel | None = (
+             self._get_flashinfer_trtllm_api_decode_kernel()
+             if can_use_xqa_or_trtllm_gen_decode
+@@ -996,9 +999,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+             )
+             self.use_trtllm_decode_attention = False
+             self.flashinfer_trtllm_api_decode_kernel = None
++        # NVFP4 KV on consumer Blackwell: flashinfer 0.6.18 XQA decode reads
++        # the paged nvfp4 cache with a compact/separated [data | scale]
++        # layout while vLLM writes it interleaved per token -> garbled
++        # decode beyond the first token. Fall back to the native decode
++        # kernel for nvfp4 KV until the XQA nvfp4 reader matches the
++        # interleaved layout (or vLLM switches to a separated layout).
+         self.use_dedicated_xqa = (
+             current_platform.is_device_capability_family(120)
+             and self.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.XQA
++            and not self.is_kvcache_nvfp4
+         )
+         supports_spec_as_decode = (
+             self.flashinfer_trtllm_api_decode_kernel
