@@ -53,13 +53,189 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
-from vllm.v1.kv_offload.tiering.fs.gc_manager import FsGCManager
 
 logger = init_logger(__name__)
 
 READY = 0
 STORE_INFLIGHT = 1
 LOAD_INFLIGHT = 2
+
+# Process-wide fs GC singleton: the scheduler-side manager and the
+# worker-side IO threads live in the SAME process (EngineCore), and on
+# headless nodes only get_worker() runs. Sharing one instance keeps every
+# node's SSD tree under the same budget without double sweeping on node1.
+#
+# NOTE: upstream FsGCManager's sweep thread proved dead on these engines
+# (frozen in a long-timeout futex wait, 0 CPU, no sweep ever ran, on all
+# four nodes). GdsGcManager reimplements the same LRU logic on the same
+# short-timeout wait pattern as gds_load_io, which is known to work here.
+_GC_SINGLETON: "GdsGcManager | None" = None
+_GC_LOCK = threading.Lock()
+
+_GC_INTERVAL_S = 300.0
+_GC_LOW_WATERMARK = 0.9
+_GC_GRACE_S = 300.0
+_BLOCK_SUFFIX = ".bin"
+
+
+class GdsGcManager:
+    """LRU on-disk budget manager for the GDS chunk tree.
+
+    API-compatible with the upstream FsGCManager (protect/release/touch are
+    used by the scheduler-side manager; headless worker processes only run
+    the sweep thread). The sweep thread uses a 50ms wait tick like
+    gds_load_io, so it cannot be frozen the way the upstream one was.
+    """
+
+    def __init__(
+        self, file_mapper: FileMapper, gc_max_size_gb: float
+    ) -> None:
+        # The scheduler builds chunk paths from ITS FileMapper (rank-0 model
+        # fingerprint) and broadcasts them; every node persists a local
+        # <base>_r0 tree under that fingerprint. Worker-side FileMappers
+        # carry a different fingerprint (per-rank fields), so do not trust
+        # base_path here: probe the actual tree instead.
+        root_dir = os.path.dirname(file_mapper.base_path)
+        try:
+            cands = [
+                d for d in os.listdir(root_dir)
+                if d.endswith("_r0") and d.startswith("_models_")
+            ]
+            newest = max(
+                cands,
+                key=lambda d: os.path.getmtime(os.path.join(root_dir, d)),
+            )
+            self.block_root = os.path.join(root_dir, newest)
+        except OSError:
+            self.block_root = f"{file_mapper.base_path}_r{file_mapper.rank}"
+        self._to_path = file_mapper.get_file_name
+        self.max_bytes = int(gc_max_size_gb * 2**30)
+        self.target_bytes = int(self.max_bytes * _GC_LOW_WATERMARK)
+        self._lock = threading.Lock()
+        self._protected: dict[str, int] = {}
+        self._stop = threading.Event()
+        self._last_sweep = 0.0
+        self._thread = threading.Thread(
+            target=self._loop, name="gds_gc", daemon=True
+        )
+        self._thread.start()
+        logger.info(
+            "GDS GC enabled: cap %.1f GiB, sweeping to %.1f GiB every %.0fs "
+            "root=%s",
+            self.max_bytes / 2**30,
+            self.target_bytes / 2**30,
+            _GC_INTERVAL_S,
+            self.block_root,
+        )
+
+    def protect(self, keys) -> None:
+        with self._lock:
+            for k in keys:
+                try:
+                    p = self._to_path(k)
+                except Exception:
+                    continue
+                self._protected[p] = self._protected.get(p, 0) + 1
+
+    def release(self, keys) -> None:
+        with self._lock:
+            for k in keys:
+                try:
+                    p = self._to_path(k)
+                except Exception:
+                    continue
+                c = self._protected.get(p)
+                if c is None:
+                    continue
+                if c <= 1:
+                    del self._protected[p]
+                else:
+                    self._protected[p] = c - 1
+
+    def touch(self, keys) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._stop.wait(0.05)
+            now = time.time()
+            if now - self._last_sweep < _GC_INTERVAL_S:
+                continue
+            self._last_sweep = now
+            try:
+                self.sweep()
+            except Exception as e:
+                logger.warning("GDS GC sweep failed: %s", e)
+
+    def sweep(self) -> int:
+        t0 = time.time()
+        blocks = []
+        total = 0
+        for dp, _dn, fn in os.walk(self.block_root):
+            for f in fn:
+                if not f.endswith(_BLOCK_SUFFIX):
+                    continue
+                p = os.path.join(dp, f)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                blocks.append((st.st_mtime, p, st.st_size))
+                total += st.st_size
+        if total <= self.max_bytes:
+            logger.info(
+                "GDS GC: %.1f GiB in %d blocks, under the %.1f GiB cap "
+                "(walk %.1fs)",
+                total / 2**30, len(blocks), self.max_bytes / 2**30,
+                time.time() - t0,
+            )
+            return 0
+        cutoff = time.time() - _GC_GRACE_S
+        with self._lock:
+            protected = set(self._protected)
+        blocks.sort()
+        freed = 0
+        removed = 0
+        for mtime, path, size in blocks:
+            if total - freed <= self.target_bytes:
+                break
+            if path in protected or mtime > cutoff:
+                continue
+            try:
+                os.unlink(path)
+            except OSError:
+                continue
+            freed += size
+            removed += 1
+            if removed % 50000 == 0:
+                logger.info(
+                    "GDS GC: freed so far %.1f GiB in %d blocks (%.1fs)",
+                    freed / 2**30, removed, time.time() - t0,
+                )
+        logger.info(
+            "GDS GC: %.1f GiB over the %.1f GiB cap, freed %.1f GiB in %d "
+            "blocks, now %.1f GiB (%.1fs)",
+            total / 2**30, self.max_bytes / 2**30, freed / 2**30,
+            removed, (total - freed) / 2**30, time.time() - t0,
+        )
+        return freed
+
+
+def get_gc(
+    file_mapper: FileMapper, gc_max_size_gb: float | None
+) -> "GdsGcManager | None":
+    """Return the per-process GDS GC (None if gc_max_size_gb unset)."""
+    global _GC_SINGLETON
+    if gc_max_size_gb is None:
+        return None
+    with _GC_LOCK:
+        if _GC_SINGLETON is None:
+            _GC_SINGLETON = GdsGcManager(file_mapper, gc_max_size_gb)
+        return _GC_SINGLETON
 
 
 def _pad4k(n: int) -> int:
@@ -119,17 +295,7 @@ class GdsOffloadingManager(OffloadingManager):
         self._inflight_loads = 0
         self._dbg = os.environ.get("VLLM_GDS_DEBUG") == "1"
         self._max_inflight_stores = max_inflight_stores
-        self._gc: FsGCManager | None = None
-        if gc_max_size_gb is not None:
-            self._gc = FsGCManager(
-                file_mapper,
-                max_bytes=int(gc_max_size_gb * 2**30),
-                low_watermark=0.9,
-                interval_s=60.0,
-                stamp_interval_s=60.0,
-                grace_s=300.0,
-                max_tracked=200_000,
-            )
+        self._gc = get_gc(file_mapper, gc_max_size_gb)
         config_path = file_mapper.get_config_file_path()
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         if not os.path.exists(config_path):
@@ -366,6 +532,7 @@ class GdsOffloadingWorker(OffloadingWorker):
         blocks_per_chunk: int,
         ring_depth: int,
         max_io_threads: int = 8,
+        gc: GdsGcManager | None = None,
     ):
         self.refs = kv_caches.group_data_refs
         self.views = [
@@ -397,6 +564,7 @@ class GdsOffloadingWorker(OffloadingWorker):
 
         self.ring_depth = max(4, ring_depth)
         self.pool, self.ring = get_pool(self.slot_bytes, self.ring_depth)
+        self._gc = gc
         logger.info(
             "GDS worker: groups=%d chunk_bytes=%s max_slot=%.2f MiB depth=%d",
             len(self.refs),
@@ -838,6 +1006,8 @@ class GdsOffloadingWorker(OffloadingWorker):
         self._ld_thread.join(timeout=5)
         self._executor.shutdown(wait=True)
         self.pool.shutdown()
+        if self._gc is not None:
+            self._gc.shutdown()
 
 class GdsDirectOffloadingSpec(OffloadingSpec):
     """
@@ -888,8 +1058,22 @@ class GdsDirectOffloadingSpec(OffloadingSpec):
 
     @override
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        fm = FileMapper.from_offloading_spec(
+            root_dir=self.extra_config.get(
+                "root_dir", "/root/.cache/kv_offload_fs"
+            ),
+            offloading_spec=self,
+            blocks_per_file=self.blocks_per_chunk,
+            parallel_agnostic=True,
+        )
+        # FsGCManager sweeps <base>_r<rank>. Every node persists chunks under
+        # the rank-0 path broadcast by the scheduler (each machine keeps its
+        # own local <base>_r0 tree), so pin rank 0 here; with the TP rank the
+        # sweep would scan a nonexistent _r1/_r2/... dir and stay silent.
+        fm.rank = 0
         return GdsOffloadingWorker(
             kv_caches=kv_caches,
             blocks_per_chunk=self.blocks_per_chunk,
             ring_depth=self._ring_depth(),
+            gc=get_gc(fm, self.extra_config.get("gc_max_size_gb")),
         )
