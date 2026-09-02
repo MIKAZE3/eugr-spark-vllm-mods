@@ -64,6 +64,16 @@ docker exec <容器> python3 /tmp/patch.py            # 输出 PATCHED 或 ALREA
 docker cp gds_direct_v1/patch_structured_outputs_guard.py <容器>:/tmp/patch2.py
 docker exec <容器> python3 /tmp/patch2.py           # 输出 PATCHED 或 ALREADY_PATCHED
 
+# 5) load 失败上报补丁（容器内执行，幂等）：
+#    OffloadingConnector 未实现 get_block_ids_with_load_errors()，
+#    load 失败时调度器毫不知情，请求带残缺 KV 继续 decode → 长上下文乱输出
+#    （09-02 实测：872 次 read 失败 + GC 淘汰 chunk 命中）。此补丁让 worker
+#    记录失败块 id 并上报 invalid_block_ids，调度器走重算路径。
+#    配套：启动脚本 kv_load_failure_policy 改为 "recompute"（失败块自动重算，
+#    而非请求报错）。
+docker cp gds_direct_v1/patch_load_failure_report.py <容器>:/tmp/patch3.py
+docker exec <容器> python3 /tmp/patch3.py           # 输出 PATCHED 或 ALREADY_PATCHED
+
 # 4) import 自检（必须成功，否则启动必挂）
 docker exec <容器> python3 -c \
   "from vllm.v1.kv_offload.gds import spec; print('IMPORT_OK')"
