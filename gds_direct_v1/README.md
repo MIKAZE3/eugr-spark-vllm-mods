@@ -57,6 +57,13 @@ docker cp gds_direct_v1/pkg/gds <容器>:/usr/local/lib/python3.12/dist-packages
 docker cp gds_direct_v1/patch_offloading_worker_assert.py <容器>:/tmp/patch.py
 docker exec <容器> python3 /tmp/patch.py            # 输出 PATCHED 或 ALREADY_PATCHED
 
+# 4) structured output 容错补丁（容器内执行，幂等）：
+#    DSpark 投机解码下 grammar 掩码与 logits 行数可能错位，
+#    上游 assert 会杀死 worker（EngineDeadError，09-02 实测复现）；
+#    此补丁改为截断对齐 + ERROR 日志（语义轻微降级但不崩）。
+docker cp gds_direct_v1/patch_structured_outputs_guard.py <容器>:/tmp/patch2.py
+docker exec <容器> python3 /tmp/patch2.py           # 输出 PATCHED 或 ALREADY_PATCHED
+
 # 4) import 自检（必须成功，否则启动必挂）
 docker exec <容器> python3 -c \
   "from vllm.v1.kv_offload.gds import spec; print('IMPORT_OK')"
