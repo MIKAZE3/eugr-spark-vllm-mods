@@ -226,10 +226,18 @@ class CuFilePool:
             pass
 
     def _get_handle(self, path: str):
+        """Return (entry, fd, ch) with a hold on the entry.
+
+        The caller MUST call _release_handle(entry) when done. The hold keeps
+        the LRU eviction from closing the fd mid-IO (observed: fd closed by an
+        eviction while another IO thread was reading -> cuFileRead returned 0
+        -> self-heal unlinked a perfectly good file).
+        """
         with self._lock:
             h = self._handles.pop(path, None)
             if h is not None:
                 self._handles[path] = h  # move to MRU end
+                h[3] += 1
                 return h
         fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_DIRECT, 0o644)
         d = CUfileDescr()
@@ -245,19 +253,33 @@ class CuFilePool:
             raise RuntimeError(
                 f"cuFileHandleRegister({path}) failed err={err} cu={cu}"
             )
+        entry = [fd, ch, path, 1]  # [fd, cufile_handle, path, refs]
         with self._lock:
             while len(self._handles) >= HANDLE_CACHE_MAX:
-                _, old = self._handles.popitem(last=False)  # evict LRU
-                self._close_entry(old)
-            self._handles[path] = (fd, ch)
-        return (fd, ch)
+                # Evict the LRU entry that is not currently in use.
+                victim = None
+                for p in self._handles:
+                    if self._handles[p][3] == 0:
+                        victim = self._handles.pop(p)
+                        break
+                if victim is None:
+                    break  # all in use; cache may exceed the soft cap
+                self._close_entry((victim[0], victim[1]))
+            self._handles[path] = entry
+        return entry
+
+    def _release_handle(self, entry) -> None:
+        with self._lock:
+            entry[3] -= 1
 
     def write_slot(self, path: str, slot_idx: int, nbytes: int) -> bool:
         """Write ring[slot_idx][:nbytes] -> path."""
+        entry = None
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             base, doff = self._buf_args(slot_idx)
-            fd, ch = self._get_handle(path)
+            entry = self._get_handle(path)
+            fd, ch = entry[0], entry[1]
             n = self.lib.cuFileWrite(
                 ch,
                 ctypes.c_void_p(base),
@@ -266,10 +288,8 @@ class CuFilePool:
                 ctypes.c_longlong(doff),
             )
             if n != nbytes:
-                with self._lock:
-                    entry = self._handles.pop(path, None)
-                if entry is not None:
-                    self._close_entry(entry)
+                self._drop_handle(path, entry)
+                entry = None
                 raise OSError(f"cuFileWrite short: {n}/{nbytes}")
             return True
         except Exception as e:
@@ -280,33 +300,59 @@ class CuFilePool:
             except OSError:
                 pass
             return False
+        finally:
+            if entry is not None:
+                self._release_handle(entry)
 
     def read_slot(self, path: str, slot_idx: int, nbytes: int) -> bool:
-        """Read path -> ring[slot_idx][:nbytes]. Unlink on failure."""
-        try:
-            base, doff = self._buf_args(slot_idx)
-            fd, ch = self._get_handle(path)
-            n = self.lib.cuFileRead(
-                ch,
-                ctypes.c_void_p(base),
-                ctypes.c_size_t(nbytes),
-                ctypes.c_longlong(0),
-                ctypes.c_longlong(doff),
-            )
-            if n != nbytes:
-                with self._lock:
-                    entry = self._handles.pop(path, None)
-                if entry is not None:
-                    self._close_entry(entry)
-                raise OSError(f"cuFileRead short: {n}/{nbytes}")
-            return True
-        except Exception as e:
-            logger.warning("GDS read %s failed: %s", path, e)
+        """Read path -> ring[slot_idx][:nbytes].
+
+        A failing read first refreshes the cached handle (a stale handle can
+        read 0 after the fd was closed by an LRU eviction), retries once, and
+        only then self-heals by unlinking the file.
+        """
+        for attempt in range(2):
+            entry = None
             try:
-                os.unlink(path)
-            except OSError:
-                pass
-            return False
+                base, doff = self._buf_args(slot_idx)
+                entry = self._get_handle(path)
+                fd, ch = entry[0], entry[1]
+                n = self.lib.cuFileRead(
+                    ch,
+                    ctypes.c_void_p(base),
+                    ctypes.c_size_t(nbytes),
+                    ctypes.c_longlong(0),
+                    ctypes.c_longlong(doff),
+                )
+                if n != nbytes:
+                    self._drop_handle(path, entry)
+                    entry = None
+                    raise OSError(f"cuFileRead short: {n}/{nbytes}")
+                return True
+            except Exception as e:
+                if attempt == 0:
+                    logger.warning(
+                        "GDS read %s failed (retrying with fresh handle): %s",
+                        path, e,
+                    )
+                else:
+                    logger.warning("GDS read %s failed: %s", path, e)
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                    return False
+            finally:
+                if entry is not None:
+                    self._release_handle(entry)
+        return False
+
+    def _drop_handle(self, path: str, entry) -> None:
+        """Remove `entry` from the cache and close its resources."""
+        with self._lock:
+            cur = self._handles.pop(path, None)
+        if cur is not None and cur is entry:
+            self._close_entry((entry[0], entry[1]))
 
     def shutdown(self):
         if self.mode == "full":
@@ -318,5 +364,5 @@ class CuFilePool:
         with self._lock:
             entries = list(self._handles.items())
             self._handles.clear()
-        for _, (fd, ch) in entries:
-            self._close_entry((fd, ch))
+        for _, e in entries:
+            self._close_entry((e[0], e[1]))

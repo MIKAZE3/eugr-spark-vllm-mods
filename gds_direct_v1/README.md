@@ -167,7 +167,7 @@ docker exec <容器> find /root/.cache/kv_offload_gds -type f | wc -l
 3. **缓存清理只动 `kv_offload_gds`**：`kv_offload_fs` 是已废弃旧方案的数据，勿误删也不要让新 spec 指向它。
 4. **冷基线顺序**：先 kill 再清缓存；清缓存后必须重启集群才生效（manager 的 _entries 在内存中）。
 5. **SSD 预算（1TiB/节点，自动 LRU）**：`gc_max_size_gb=1024` 为上限，自研 `GdsGcManager` 每 300s 巡检，超限按 mtime 压回 921.6GiB。⚠️ **勿回退上游 FsGCManager**——其 sweep 线程在引擎进程内冻结（长超时 futex 不醒、0 CPU），且 headless 节点 FileMapper 指纹/rank 与实树不符会导致空转（曾致 node2~4 缓存无上限暴涨打满磁盘）。异常征兆：日志无 `GDS GC:` 行或树越界增长。
-6. **句柄/fd**：cuFile 句柄 LRU 上限 4096（cufile_io.py `HANDLE_CACHE_MAX`），正常无需干预；若日志出现 EMFILE 检查是否改动过该值。
+6. **句柄/fd**：cuFile 句柄 LRU 上限 4096（cufile_io.py `HANDLE_CACHE_MAX`）+ **引用计数保护**——IO 期间的句柄不会被淘汰关闭（曾因淘汰竞态导致 `cuFileRead` 返回 0 → 自愈误删完好文件 → 重算风暴，09-03 修复）；读失败先换新句柄重试一次再 unlink。正常无需干预；若日志出现 EMFILE 检查是否改动过该值。
 7. **GDSDBG 插桩**：`VLLM_GDS_DEBUG=1` 时 GDSDBG 日志量大，稳定运行后可移除该行。
 8. **b12x JIT 偶发挂死**（环境级）：worker 栈停在 `cutlass/base_dsl/jit_executor.py` 超 10 分钟不动 → `docker restart` 容器后按 §四 重启。
 9. **API 响应字段**：本 fork 的 thinking 输出字段是 `reasoning`（非 `reasoning_content`）；max_tokens 过小会被 reasoning 耗尽导致 content 为空（正常现象）。
