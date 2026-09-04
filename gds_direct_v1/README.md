@@ -172,7 +172,7 @@ docker exec <容器> find /root/.cache/kv_offload_gds -type f | wc -l
 8. **b12x JIT 偶发挂死**（环境级）：worker 栈停在 `cutlass/base_dsl/jit_executor.py` 超 10 分钟不动 → `docker restart` 容器后按 §四 重启。
 9. **API 响应字段**：本 fork 的 thinking 输出字段是 `reasoning`（非 `reasoning_content`）；max_tokens 过小会被 reasoning 耗尽导致 content 为空（正常现象）。
 10. **跨重启复用**依赖 `PYTHONHASHSEED=0` 与相同模型路径/指纹；换模型目录后旧缓存自然失效（路径含模型指纹）。
-11. **GDS 设备节点自愈**：docker restart 会清空容器 /dev（mknod 节点丢失、悄然降级 compat）；启动脚本已内置自愈（`MAJOR=$(grep -i nvidia-fs /proc/devices ...)` + mknod），保持启动脚本含该段即可。
+11. **GDS 设备节点自愈**：docker restart 会清空容器 /dev（mknod 节点丢失、悄然降级 compat）；启动脚本已内置自愈（`MAJOR=$(grep -i nvidia-fs /proc/devices | awk '{print $1}')` + mknod，注意 awk 单引号必须保留——`$1` 被双引号展开会静默失效）。**宿主重启后必须核对**：`lsmod | grep nvidia_fs`（模块不会自动加载，已注入 /etc/rc.local `modprobe nvidia_fs` 开机自启）、容器 `/dev/nvidia-fs`、引擎日志 `mode=full`。模块缺失的症状：`GDS read ... failed: cuFileRead short: 0/1077248` 海量出现 + 引擎吞吐暴跌。
 
 ## 七、回滚
 
